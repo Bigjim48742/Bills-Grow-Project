@@ -1,0 +1,387 @@
+
+
+#include <EEPROM.h>
+#include <LiquidCrystal.h>
+#include <Wire.h>
+#include "RTClib.h"
+
+RTC_DS3231 rtc;
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
+int lcd_key     = 0;
+int adc_key_in  = 0;
+
+#define btnRIGHT  0
+#define btnUP     1
+#define btnDOWN   2
+#define btnLEFT   3
+#define btnSELECT 4
+#define btnNONE   5
+
+
+
+int read_LCD_buttons(){               // read the buttons
+    adc_key_in = analogRead(0);       // read the value from the sensor 
+
+    // my buttons when read are centered at these valies: 0, 144, 329, 504, 741
+    // we add approx 50 to those values and check to see if we are close
+    // We make this the 1st option for speed reasons since it will be the most likely result
+
+    if (adc_key_in > 1000) return btnNONE; 
+
+    // For V1.1 us this threshold
+    if (adc_key_in < 50)   return btnRIGHT;  
+    if (adc_key_in < 250)  return btnUP; 
+    if (adc_key_in < 450)  return btnDOWN; 
+    if (adc_key_in < 650)  return btnLEFT; 
+    if (adc_key_in < 850)  return btnSELECT;  
+
+    return btnNONE;                // when all others fail, return this.
+}
+//My scratch notes
+//measuredPH-6.8580 roomTempMeasuredPH-6.8965
+//tempC-28.0195 phVolts-2.3535 7CalVolts-2.3047 4CalVolts-3.3594 4CalTempAdjusted-3.9640
+
+
+//float volt4 = 3.359;
+//float volt7 = 3.022;
+//float calibrationTempC = 21;
+
+float volt4 = 3.0514;
+float volt7 = 2.5833;
+float calibrationTempC = 31.1;
+//Flags
+boolean phUp = false;
+boolean phDown = false;
+boolean calibrate4;
+boolean calibrate7;
+long clk;
+long clkSet;
+int clk10min = 600;
+long phUpClk;
+long phDownClk;
+float phHigh = 5.9;
+float phLow = 5.6;
+
+
+//A3 = temp
+//A2 = PH
+//CALIBRATE = D8
+int phPin = A9;
+int tempPin = A8;
+//int calPin = AO;
+int relayDown = A11;
+int relayUp = A10;
+
+
+void setup()
+{
+  //LcdInitialise();
+  //LcdClear();
+  Serial.begin(9600);
+
+  pinMode(relayUp, OUTPUT);
+  pinMode(relayDown, OUTPUT);
+  
+  digitalWrite(relayUp, HIGH);
+  digitalWrite(relayDown, HIGH);
+  
+
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  delay(3000); // wait for console opening
+
+  if (! rtc.begin()) {
+    Serial.println("Couldn't find RTC");
+    while (1);
+  }
+
+  if (rtc.lostPower()) {
+    Serial.println("RTC lost power, lets set the time!");
+    // following line sets the RTC to the date & time this sketch was compiled
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    // This line sets the RTC with an explicit date & time, for example to set
+    // January 21, 2014 at 3am you would call:
+    // rtc.adjust(DateTime(2014, 1, 21, 3, 0, 0));
+  }
+}
+
+float measurePHVolts()
+{
+  float phADC = analogRead(phPin);
+  float phVolts = (phADC / 1024.0) * 5.0;
+  return phVolts;
+}
+
+float getTempAdjusted4()
+{
+  //http://www.omega.com/Green/pdf/pHbasics_REF.pdf
+  float adjustTemp = calibrationTempC;
+  float difference = adjustTemp - 25;
+  float phAdjust = (0.009 * difference);
+  float tempAdjusted4 = 4 + phAdjust;
+  return tempAdjusted4;
+}
+
+float measurePH()
+{
+
+  float phVolt = measurePHVolts();
+
+  float tempAdjusted4 = getTempAdjusted4();
+  float voltsPerPH = (abs(volt7 - volt4)) / (7 - tempAdjusted4);
+
+  //acid ph's produce positive voltages, basic ph's produce negative voltages
+  //that one site was wrong
+
+  float realPHVolt = (volt7 - phVolt);
+  float phUnits = realPHVolt / voltsPerPH;
+  float measuredPH = 7 + phUnits;
+
+  return measuredPH;
+}
+
+float doPHTempCompensation(float PH, float temp)
+{
+  float difference = temp - 25;
+  float phAdjust = (0.009 * difference);
+  float tempAdjustedPH = PH + phAdjust;
+  return tempAdjustedPH;
+}
+
+
+float measureTempC()
+{
+  float tempADC = analogRead(tempPin);
+  float tempVolts = (tempADC / 1024) * 5.0;
+  float tempC = (tempVolts / 0.010);
+  return tempC;
+}
+
+
+
+// floatToString.h
+//
+// Tim Hirzel
+// tim@growdown.com
+// March 2008
+// float to string
+//
+// If you don't save this as a .h, you will want to remove the default arguments
+//     uncomment this first line, and swap it for the next.  I don't think keyword arguments compile in .pde files
+
+//char * floatToString(char * outstr, float value, int places, int minwidth=, bool rightjustify) {
+char * floatToString(char * outstr, float value, int places, int minwidth = 0, bool rightjustify = false) {
+  // this is used to write a float value to string, outstr.  oustr is also the return value.
+  int digit;
+  float tens = 0.1;
+  int tenscount = 0;
+  int i;
+  float tempfloat = value;
+  int c = 0;
+  int charcount = 1;
+  int extra = 0;
+  // make sure we round properly. this could use pow from <math.h>, but doesn't seem worth the import
+  // if this rounding step isn't here, the value  54.321 prints as 54.3209
+
+  // calculate rounding term d:   0.5/pow(10,places)
+  float d = 0.5;
+  if (value < 0)
+    d *= -1.0;
+  // divide by ten for each decimal place
+  for (i = 0; i < places; i++)
+    d /= 10.0;
+  // this small addition, combined with truncation will round our values properly
+  tempfloat +=  d;
+
+  // first get value tens to be the large power of ten less than value
+  if (value < 0)
+    tempfloat *= -1.0;
+  while ((tens * 10.0) <= tempfloat) {
+    tens *= 10.0;
+    tenscount += 1;
+  }
+
+  if (tenscount > 0)
+    charcount += tenscount;
+  else
+    charcount += 1;
+
+  if (value < 0)
+    charcount += 1;
+  charcount += 1 + places;
+
+  minwidth += 1; // both count the null final character
+  if (minwidth > charcount) {
+    extra = minwidth - charcount;
+    charcount = minwidth;
+  }
+
+  if (extra > 0 and rightjustify) {
+    for (int i = 0; i < extra; i++) {
+      outstr[c++] = ' ';
+    }
+  }
+
+  // write out the negative if needed
+  if (value < 0)
+    outstr[c++] = '-';
+
+  if (tenscount == 0)
+    outstr[c++] = '0';
+
+  for (i = 0; i < tenscount; i++) {
+    digit = (int) (tempfloat / tens);
+    itoa(digit, &outstr[c++], 10);
+    tempfloat = tempfloat - ((float)digit * tens);
+    tens /= 10.0;
+  }
+
+  // if no places after decimal, stop now and return
+
+  // otherwise, write the point and continue on
+  if (places > 0)
+    outstr[c++] = '.';
+
+
+  // now write out each decimal place by shifting digits one by one into the ones place and writing the truncated value
+  for (i = 0; i < places; i++) {
+    tempfloat *= 10.0;
+    digit = (int) tempfloat;
+    itoa(digit, &outstr[c++], 10);
+    // once written, subtract off that digit
+    tempfloat = tempfloat - (float) digit;
+  }
+  if (extra > 0 and not rightjustify) {
+    for (int i = 0; i < extra; i++) {
+      outstr[c++] = ' ';
+    }
+  }
+
+
+  outstr[c++] = '\0';
+  return outstr;
+}
+
+
+void loop()
+{
+  DateTime now = rtc.now();
+  clk = now.unixtime();
+  Serial.print(clk);
+  lcd_key = read_LCD_buttons();   // read the buttons
+  switch (lcd_key)
+    {
+      btnNONE:{break;}
+    }
+  int x;
+  int sampleSize = 500;
+
+  float avgMeasuredPH = 0;
+  float avgRoomTempMeasuredPH = 0;
+  float avgTemp = 0;
+  float avgPHVolts = 0;
+  float avgVoltsPerPH = 0;
+  float phTemp = 0;
+
+
+  float tempAdjusted4 = getTempAdjusted4();
+
+  for (x = 0; x < sampleSize; x++)
+  {
+
+    float measuredPH = measurePH();
+    float phTemp = measureTempC();
+    float roomTempPH = doPHTempCompensation(measuredPH, phTemp);
+
+    float phVolt = measurePHVolts();
+
+    avgMeasuredPH += measuredPH;
+    avgRoomTempMeasuredPH += roomTempPH;
+    avgTemp += phTemp;
+    avgPHVolts += phVolt;
+  }
+
+  avgMeasuredPH /= sampleSize;
+  avgRoomTempMeasuredPH /= sampleSize;
+  avgTemp /= sampleSize;
+  avgPHVolts /= sampleSize;
+
+  Serial.print(" measuredPH-");
+  Serial.print(avgMeasuredPH, 4);
+  Serial.print(" roomTempMeasuredPH-");
+  Serial.print(avgRoomTempMeasuredPH, 4);
+  Serial.print(" tempC-");
+  Serial.print(avgTemp, 4);
+  Serial.print(" phVolts-");
+  Serial.print(avgPHVolts, 4);
+  Serial.print(" 7CalVolts-");
+  Serial.print(volt7, 4);
+  Serial.print(" 4CalVolts-");
+  Serial.print(volt4, 4);
+  Serial.print(" 4CalTempAdjusted-");
+  Serial.println(tempAdjusted4, 4);
+
+
+  //drawBox();
+  char charBuffer[25];
+  //gotoXY(5,1);
+  lcd.setCursor(0, 0);
+  //LcdString("PH:");
+  lcd.print("PH:");
+  //gotoXY(30,1);
+  lcd.setCursor(4, 0);
+  floatToString(charBuffer, avgRoomTempMeasuredPH, 2);
+  //floatToString(charBuffer, avgRoomTempMeasuredPH, 2);
+  //LcdString(charBuffer);
+  lcd.print(charBuffer);
+
+  //gotoXY(4, 2);
+  lcd.setCursor(0, 1);
+  lcd.print("Tmp: ");
+  //gotoXY(45, 2);
+  lcd.setCursor(5, 1);
+  floatToString(charBuffer, avgTemp, 1);
+  // LcdString(charBuffer);
+  lcd.print(charBuffer);
+
+  //gotoXY(4, 3);
+  lcd.setCursor(8, 0);
+  //LcdString("V:");
+  lcd.print("V:");
+  //gotoXY(20, 3);
+  lcd.setCursor(10, 0);
+  floatToString(charBuffer, avgPHVolts, 3);
+  //LcdString(charBuffer);
+  lcd.print(charBuffer);
+
+  if (avgMeasuredPH < phLow)
+  {
+    digitalWrite(relayUp, LOW);
+    //gotoXY(4,4);
+    lcd.setCursor(9, 1);
+    //LcdString("dosing on");
+    lcd.print("Dos:ON ");
+    delay(5000);
+    lcd.setCursor(9, 1);
+    digitalWrite(relayUp, HIGH);
+    //LcdString("dosing off");
+    lcd.print("Dos:OFF");
+  }
+    
+    if (avgMeasuredPH > phHigh)
+  {
+    digitalWrite(relayDown, LOW);
+    //gotoXY(4,4);
+    lcd.setCursor(9, 1);
+    //LcdString("dosing on");
+    lcd.print("Dos:ON ");
+    delay(5000);
+    digitalWrite(relayDown, HIGH);
+    lcd.setCursor(9, 1);
+    //LcdString("dosing off");
+    lcd.print("Dos:OFF");
+  }
+  
+    
+  }
